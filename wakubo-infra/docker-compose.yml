@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: wakubo-pg
+    environment:
+      POSTGRES_DB: wakubo_temp
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: faGGersum
+    ports:
+      - "5432:5432"
+    volumes:
+      - wakubo_pgdata:/var/lib/postgresql/data
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: wakubo-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: samarsparsh18@gmail.com
+      PGADMIN_DEFAULT_PASSWORD: faGGersum
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+
+volumes:
+  wakubo_pgdata:

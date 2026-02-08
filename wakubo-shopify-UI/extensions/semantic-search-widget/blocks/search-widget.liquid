@@ -1,0 +1,150 @@
+{{ 'search-widget.css' | asset_url | stylesheet_tag }}
+
+{%- comment -%} Capture theme colors and fonts {%- endcomment -%}
+{%- liquid
+  assign primary_color = settings.colors_accent_1 | default: '#667eea'
+  assign text_color = settings.colors_text | default: '#2d3748'
+  assign bg_color = settings.colors_background_1 | default: '#ffffff'
+  assign button_text = settings.colors_solid_button_labels | default: '#ffffff'
+  
+  assign font_heading = settings.type_header_font.family | default: 'sans-serif'
+  assign font_body = settings.type_body_font.family | default: 'sans-serif'
+-%}
+
+<div 
+  id="semantic-search-float" 
+  class="semantic-search-minimized"
+  data-theme-primary="{{ primary_color }}"
+  data-theme-text="{{ text_color }}"
+  data-theme-bg="{{ bg_color }}"
+  data-theme-button-text="{{ button_text }}"
+  data-font-heading="{{ font_heading }}"
+  data-font-body="{{ font_body }}"
+  style="--theme-primary: {{ primary_color }}; --theme-text: {{ text_color }}; --theme-bg: {{ bg_color }}; --theme-button-text: {{ button_text }}; --font-heading: {{ font_heading }}; --font-body: {{ font_body }};"
+>
+  <!-- Minimized state (FAB button) -->
+  <button id="search-fab" class="search-fab" type="button" title="{{ block.settings.heading }}">
+    <span class="fab-icon-container"><span class="icon-fallback">{{ block.settings.fab_icon | default: '🔍' }}</span></span>
+  </button>
+  
+  <!-- Expanded floating widget -->
+  <div id="search-panel" class="search-panel">
+    <div class="search-header" id="search-drag-handle">
+      <span class="search-title">{{ block.settings.heading }}</span>
+      <button id="minimize-btn" class="minimize-btn" type="button" aria-label="Minimize">−</button>
+    </div>
+    
+    <div class="search-body">
+      <div class="search-box">
+        <input
+          type="text"
+          id="search-input"
+          placeholder="{{ block.settings.search_placeholder }}"
+          aria-label="Search products"
+        />
+        <button
+          id="search-btn"
+          type="button"
+          data-api="{{ block.settings.api_endpoint }}"
+        >
+          {{ block.settings.button_label }}
+        </button>
+      </div>
+      
+      <div class="camera-upload">
+        <label for="camera-input" class="camera-btn">
+          <span class="camera-icon-container"><span class="icon-fallback">📷</span></span> {{ block.settings.camera_label }}
+        </label>
+        <input
+          type="file"
+          id="camera-input"
+          accept="image/*"
+          capture="environment"
+          style="display:none;"
+          aria-label="Upload image for search"
+        />
+      </div>
+      
+      <div id="search-results" class="search-results"></div>
+    </div>
+  </div>
+</div>
+
+{{ 'search-widget.js' | asset_url | script_tag }}
+
+{% schema %}
+{
+  "name": "Semantic Search",
+  "target": "section",
+  "settings": [
+    {
+      "type": "header",
+      "content": "Widget Content"
+    },
+    { "type": "text", "id": "heading", "label": "Widget Title", "default": "Semantic Search" },
+    { "type": "text", "id": "fab_icon", "label": "FAB Icon (Emoji)", "default": "🔍", "info": "Icon shown when minimized" },
+    { "type": "text", "id": "search_placeholder", "label": "Search Placeholder", "default": "Search products..." },
+    { "type": "text", "id": "button_label", "label": "Search Button Label", "default": "Search" },
+    { "type": "text", "id": "camera_label", "label": "Camera Button Label", "default": "Search by Image" },
+    { "type": "text", "id": "api_endpoint", "label": "API Endpoint", "default": "http://localhost:8000" },
+    {
+      "type": "header",
+      "content": "Appearance Override"
+    },
+    {
+      "type": "paragraph",
+      "content": "Leave blank to auto-detect from theme. Override only if needed."
+    },
+    { "type": "color", "id": "custom_primary_color", "label": "Custom Primary Color (optional)" },
+    { "type": "color", "id": "custom_text_color", "label": "Custom Text Color (optional)" },
+    { "type": "color", "id": "custom_bg_color", "label": "Custom Background Color (optional)" },
+    {
+      "type": "select",
+      "id": "widget_position",
+      "label": "Widget Position",
+      "options": [
+        { "value": "bottom-right", "label": "Bottom Right" },
+        { "value": "bottom-left", "label": "Bottom Left" },
+        { "value": "top-right", "label": "Top Right" },
+        { "value": "top-left", "label": "Top Left" }
+      ],
+      "default": "bottom-right"
+    }
+  ]
+}
+{% endschema %}
+
+<style>
+  /* Apply custom overrides if merchant sets them */
+  {% if block.settings.custom_primary_color != blank %}
+    #semantic-search-float {
+      --theme-primary: {{ block.settings.custom_primary_color }} !important;
+    }
+  {% endif %}
+  
+  {% if block.settings.custom_text_color != blank %}
+    #semantic-search-float {
+      --theme-text: {{ block.settings.custom_text_color }} !important;
+    }
+  {% endif %}
+  
+  {% if block.settings.custom_bg_color != blank %}
+    #semantic-search-float {
+      --theme-bg: {{ block.settings.custom_bg_color }} !important;
+    }
+  {% endif %}
+  
+  /* Position based on merchant setting */
+  #semantic-search-float {
+    {% case block.settings.widget_position %}
+      {% when 'bottom-right' %}
+        bottom: 20px; right: 20px; top: auto; left: auto;
+      {% when 'bottom-left' %}
+        bottom: 20px; left: 20px; top: auto; right: auto;
+      {% when 'top-right' %}
+        top: 80px; right: 20px; bottom: auto; left: auto;
+      {% when 'top-left' %}
+        top: 80px; left: 20px; bottom: auto; right: auto;
+    {% endcase %}
+  }
+</style>
