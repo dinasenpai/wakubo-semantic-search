@@ -143,9 +143,9 @@ def upsert_product_to_qdrant(
                     "shopify_gid": shopify_gid,  # Store full gid in payload for PostgreSQL lookup
                     "title": title,
                     "handle": handle,
+                    "description": description,
                     "product_url": product_url,
                 }
             }
         ]
     )
-

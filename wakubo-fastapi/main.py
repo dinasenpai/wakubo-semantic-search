@@ -5,21 +5,23 @@ import secrets
 import time
 import urllib.parse
 import requests
+import torch
+import clip
+import io
 
-from fastapi import FastAPI, Depends, Form, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, Depends, Form, HTTPException, Request, BackgroundTasks, UploadFile, File
 from fastapi.responses import RedirectResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
-
-from dotenv import load_dotenv
-load_dotenv()
+from PIL import Image
+from qdrant_client import QdrantClient
+from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 from db import Base, engine, get_db
 from models import ShopToken, Product
+from embedding import init_qdrant_collection, upsert_product_to_qdrant, get_clip_model
 
-from qdrant_client import QdrantClient
-from embedding import init_qdrant_collection, upsert_product_to_qdrant
 
 app = FastAPI(title="Wakubo Semantic Search Backend")
 
@@ -398,35 +400,284 @@ def sync_single_product(shop: str, product_gid: str, db: Session):
 
 @app.post("/api/search/text")
 def search_text(query: str = Form(...), shop: str = Form(None), db: Session = Depends(get_db)):
-    """Search products by text query"""
-    q = f"%{query}%"
+    """
+    Optimized text search with 3-tier fallback:
+    1. PostgreSQL ILIKE (fastest regex)
+    2. Qdrant payload regex (title + description)
+    3. Qdrant text embedding vector search (semantic)
+    """
+    if not query or not query.strip():
+        return {"products": []}
     
-    # Build query
+    query_lower = query.lower().strip()
+    
+    # Step 1: Try PostgreSQL ILIKE (fastest)
+    q = f"%{query}%"
     sql_query = db.query(Product).filter(
         or_(Product.title.ilike(q), Product.description.ilike(q))
     )
-    
-    # Filter by shop if provided
     if shop:
         sql_query = sql_query.filter(Product.shop == shop)
     
     rows = sql_query.limit(10).all()
     
-    return {
-        "products": [
-            {
-                "id": r.id,
-                "title": r.title,
-                "description": r.description[:200],
-                "price": "0.00",
-                "handle": r.handle,
-                "image_url": r.image_url,
-                "product_url": r.product_url,
-                "score": 1.0,
+    if rows:
+        return {
+            "products": [
+                {
+                    "id": r.id,
+                    "title": r.title,
+                    "description": r.description[:200] if r.description else "",
+                    "price": "0.00",
+                    "handle": r.handle,
+                    "image_url": r.image_url,
+                    "product_url": r.product_url,
+                    "score": 1.0,
+                    "source": "postgresql"
+                }
+                for r in rows
+            ]
+        }
+    
+    # Step 2: Try Qdrant payload scroll (regex match on title + description)
+    try:
+        scroll_filter = None
+        if shop:
+            scroll_filter = Filter(must=[FieldCondition(key="shop", match=MatchValue(value=shop))])
+        
+        # Scroll through all products for this shop
+        scroll_results, _ = qdrant_client.scroll(
+            collection_name=QDRANT_COLLECTION,
+            scroll_filter=scroll_filter,
+            limit=100,  # Get more to filter locally
+            with_payload=True,
+            with_vectors=False,
+        )
+        
+        # Filter locally by regex on title + description
+        matched = []
+        for point in scroll_results:
+            title = point.payload.get("title", "").lower()
+            description = point.payload.get("description", "").lower()
+            
+            if query_lower in title or query_lower in description:
+                matched.append(point.payload["shopify_gid"])
+        
+        if matched:
+            rows = db.query(Product).filter(Product.shopify_gid.in_(matched[:10])).all()
+            
+            if rows:
+                return {
+                    "products": [
+                        {
+                            "id": r.id,
+                            "title": r.title,
+                            "description": r.description[:200] if r.description else "",
+                            "price": "0.00",
+                            "handle": r.handle,
+                            "image_url": r.image_url,
+                            "product_url": r.product_url,
+                            "score": 0.9,
+                            "source": "qdrant_payload"
+                        }
+                        for r in rows
+                    ]
+                }
+    except Exception as e:
+        print(f"⚠️ Qdrant payload search failed: {e}")
+    
+    # Step 3: Text embedding vector search (semantic, slowest)
+    try:
+        print(f"🔤 Text embedding search for: '{query}'")
+        
+        model, _, device = get_clip_model()
+        
+        # Embed query text
+        text_tokens = clip.tokenize([query], truncate=True).to(device)
+        with torch.no_grad():
+            txt_emb = model.encode_text(text_tokens)
+            txt_emb = txt_emb / txt_emb.norm(dim=-1, keepdim=True)
+            query_vector = txt_emb.cpu().numpy().flatten().tolist()
+        
+        # Debug: Print embedding sample
+        print(f"🔤 Query embedding sample: {query_vector[:10]}")
+        print(f"🔤 Query embedding length: {len(query_vector)}")
+        
+        # Build filter
+        search_filter = None
+        if shop:
+            search_filter = Filter(must=[FieldCondition(key="shop", match=MatchValue(value=shop))])
+            print(f"🔤 Filtering by shop: {shop}")
+        
+        # Search Qdrant with text vector (qdrant-client 1.16.2 API)
+        search_result = qdrant_client.query_points(
+            collection_name=QDRANT_COLLECTION,
+            query=query_vector,
+            using="text",
+            query_filter=search_filter,
+            limit=10,
+            score_threshold=0.3,  # Lowered threshold like image search
+        )
+        
+        results = search_result.points if hasattr(search_result, 'points') else search_result
+        
+        # Debug: Print all results with scores
+        print(f"🔤 Found {len(results)} results:")
+        for r in results:
+            print(f"  - {r.payload.get('title', 'N/A')} (score: {r.score:.4f})")
+        
+        if results:
+            shopify_gids = [r.payload["shopify_gid"] for r in results]
+            rows = db.query(Product).filter(Product.shopify_gid.in_(shopify_gids)).all()
+            
+            # Create score map and sort by score (same as image search)
+            score_map = {r.payload["shopify_gid"]: r.score for r in results}
+            rows_sorted = sorted(rows, key=lambda x: score_map.get(x.shopify_gid, 0), reverse=True)
+            
+            return {
+                "products": [
+                    {
+                        "id": r.id,
+                        "title": r.title,
+                        "description": r.description[:200] if r.description else "",
+                        "price": "0.00",
+                        "handle": r.handle,
+                        "image_url": r.image_url,
+                        "product_url": r.product_url,
+                        "score": round(score_map.get(r.shopify_gid, 0.5), 4),  # Round to 4 decimals
+                        "source": "qdrant_embedding"
+                    }
+                    for r in rows_sorted
+                ]
             }
-            for r in rows
-        ]
-    }
+    except Exception as e:
+        print(f"⚠️ Qdrant embedding search failed: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    return {"products": []}
+
+@app.post("/api/search/image")
+async def search_image(
+    image: UploadFile = File(...),
+    shop: str = Form(None),
+    db: Session = Depends(get_db)
+):
+    """Search products by uploaded image using image embedding."""
+    try:
+        # Read uploaded image
+        print(f"📸 Received image: {image.filename}, content_type: {image.content_type}, size: {image.size if hasattr(image, 'size') else 'unknown'}")
+        
+        contents = await image.read()
+        print(f"📸 Read {len(contents)} bytes")
+        
+        image_pil = Image.open(io.BytesIO(contents)).convert("RGB")
+        print(f"📸 Image opened: {image_pil.size}, mode: {image_pil.mode}")
+        
+        # Get CLIP model
+        model, preprocess, device = get_clip_model()
+        
+        # Embed query image
+        image_tensor = preprocess(image_pil).unsqueeze(0).to(device)
+        print(f"📸 Image tensor shape: {image_tensor.shape}")
+        
+        with torch.no_grad():
+            img_emb = model.encode_image(image_tensor)
+            img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
+            query_vector = img_emb.cpu().numpy().flatten().tolist()
+        
+        # Debug: Print first 10 values of embedding
+        print(f"📸 Query embedding sample: {query_vector[:10]}")
+        print(f"📸 Query embedding length: {len(query_vector)}")
+        
+        # Build filter
+        search_filter = None
+        if shop:
+            search_filter = Filter(must=[FieldCondition(key="shop", match=MatchValue(value=shop))])
+            print(f"📸 Filtering by shop: {shop}")
+        
+        # Search Qdrant with image vector
+        search_result = qdrant_client.query_points(
+            collection_name=QDRANT_COLLECTION,
+            query=query_vector,
+            using="image",
+            query_filter=search_filter,
+            limit=10,
+            score_threshold=0.3,  # Lowered threshold
+        )
+        
+        results = search_result.points if hasattr(search_result, 'points') else search_result
+        
+        # Debug: Print all results with scores
+        print(f"📸 Found {len(results)} results:")
+        for r in results:
+            print(f"  - {r.payload.get('title', 'N/A')} (score: {r.score:.4f})")
+        
+        if not results:
+            print("📸 No results found")
+            return {"products": []}
+        
+        # Get full product data from PostgreSQL
+        shopify_gids = [r.payload["shopify_gid"] for r in results]
+        rows = db.query(Product).filter(Product.shopify_gid.in_(shopify_gids)).all()
+        
+        # Create score map and sort by score
+        score_map = {r.payload["shopify_gid"]: r.score for r in results}
+        rows_sorted = sorted(rows, key=lambda x: score_map.get(x.shopify_gid, 0), reverse=True)
+        
+        return {
+            "products": [
+                {
+                    "id": r.id,
+                    "title": r.title,
+                    "description": r.description[:200] if r.description else "",
+                    "price": "0.00",
+                    "handle": r.handle,
+                    "image_url": r.image_url,
+                    "product_url": r.product_url,
+                    "score": round(score_map.get(r.shopify_gid, 0.5), 4),
+                    "source": "image_search"
+                }
+                for r in rows_sorted
+            ]
+        }
+    
+    except Exception as e:
+        print(f"❌ Image search error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Image search failed: {str(e)}")
+
+@app.get("/admin/sync-status")
+def sync_status(shop: str, db: Session = Depends(get_db)):
+    """Check sync status for a shop"""
+    try:
+        # Check if shop is installed
+        token = get_shop_token(db, shop)
+        
+        # Count products in PostgreSQL
+        pg_count = db.query(Product).filter_by(shop=shop).count()
+        
+        # Count products in Qdrant (approximate via scroll)
+        search_filter = Filter(must=[FieldCondition(key="shop", match=MatchValue(value=shop))])
+        qdrant_result, _ = qdrant_client.scroll(
+            collection_name=QDRANT_COLLECTION,
+            scroll_filter=search_filter,
+            limit=100,
+            with_payload=False,
+            with_vectors=False
+        )
+        
+        qdrant_count = len(qdrant_result)
+        
+        return {
+            "shop": shop,
+            "postgresql_products": pg_count,
+            "qdrant_embeddings": qdrant_count,
+            "status": "synced" if pg_count > 0 and qdrant_count > 0 else "syncing"
+        }
+    except HTTPException:
+        return {"shop": shop, "status": "not_installed"}
 
 @app.get("/health")
 def health():
