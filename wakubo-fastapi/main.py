@@ -12,8 +12,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from db import Base, engine, get_db
 from models import ShopToken, Product
+
+from qdrant_client import QdrantClient
+from embedding import init_qdrant_collection, upsert_product_to_qdrant
 
 app = FastAPI(title="Wakubo Semantic Search Backend")
 
@@ -25,6 +31,12 @@ SHOPIFY_API_KEY = os.getenv("SHOPIFY_API_KEY")
 SHOPIFY_API_SECRET = os.getenv("SHOPIFY_API_SECRET")
 SCOPES = os.getenv("SCOPES", "read_products")
 APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8000")
+QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "wakubo_products")
+IMAGE_WEIGHT = float(os.getenv("IMAGE_WEIGHT", "0.6"))
+
+qdrant_client = QdrantClient(url=QDRANT_URL)
+init_qdrant_collection(qdrant_client, QDRANT_COLLECTION)
 
 # CORS - allow any Shopify store + local dev
 app.add_middleware(
@@ -205,22 +217,34 @@ async def shopify_webhook(
     data = await request.json()
     
     if topic in ["products/create", "products/update"]:
-        # Sync single product
+        # Sync single product to PostgreSQL + Qdrant
         product_gid = f"gid://shopify/Product/{data['id']}"
         background_tasks.add_task(sync_single_product, shop, product_gid, db)
     
     elif topic == "products/delete":
-        # Remove from DB
+        # Remove from PostgreSQL and Qdrant
         product_gid = f"gid://shopify/Product/{data['id']}"
         db.query(Product).filter_by(shopify_gid=product_gid).delete()
         db.commit()
+        
+        # Delete from Qdrant using numeric ID
+        try:
+            numeric_id = int(product_gid.split("/")[-1])
+            qdrant_client.delete(
+                collection_name=QDRANT_COLLECTION,
+                points_selector=[numeric_id]
+            )
+            print(f"✅ Deleted {product_gid} from Qdrant")
+        except Exception as e:
+            print(f"⚠️ Failed to delete from Qdrant: {e}")
+
     
     return {"status": "ok"}
 
 # ==================== Sync Functions ====================
 
 def sync_shop_products(shop: str, access_token: str, db: Session):
-    """Background job: Sync all products for a shop"""
+    """Background job: Sync all products for a shop to PostgreSQL and Qdrant"""
     query = """
     query Products($first: Int!, $after: String) {
       products(first: $first, after: $after) {
@@ -240,11 +264,12 @@ def sync_shop_products(shop: str, access_token: str, db: Session):
     """
     
     after = None
-    total = 0
+    total_pg = 0
+    total_qdrant = 0
     
     while True:
         try:
-            data = shopify_graphql(shop, access_token, query, {"first": 100, "after": after})
+            data = shopify_graphql(shop, access_token, query, {"first": 50, "after": after})
             conn = data["data"]["products"]
             
             for edge in conn["edges"]:
@@ -257,7 +282,7 @@ def sync_shop_products(shop: str, access_token: str, db: Session):
                 image_url = (n.get("featuredImage") or {}).get("url") or ""
                 product_url = n.get("onlineStoreUrl") or f"https://{shop}/products/{handle}"
                 
-                # Upsert product
+                # 1. Upsert to PostgreSQL
                 product = db.query(Product).filter_by(shopify_gid=gid).first()
                 if not product:
                     product = Product(shop=shop, shopify_gid=gid)
@@ -269,7 +294,26 @@ def sync_shop_products(shop: str, access_token: str, db: Session):
                 product.product_url = product_url
                 
                 db.add(product)
-                total += 1
+                total_pg += 1
+                
+                # 2. Embed and upsert to Qdrant
+                try:
+                    upsert_product_to_qdrant(
+                        client=qdrant_client,
+                        collection_name=QDRANT_COLLECTION,
+                        shopify_gid=gid,
+                        shop=shop,
+                        title=title,
+                        description=description,
+                        handle=handle,
+                        image_url=image_url,
+                        product_url=product_url,
+                        image_weight=IMAGE_WEIGHT
+                    )
+                    total_qdrant += 1
+                    print(f"✅ Embedded: {title[:50]}")
+                except Exception as e:
+                    print(f"⚠️ Failed to embed {gid}: {e}")
             
             db.commit()
             
@@ -279,13 +323,13 @@ def sync_shop_products(shop: str, access_token: str, db: Session):
             after = conn["pageInfo"]["endCursor"]
         
         except Exception as e:
-            print(f"Error syncing products for {shop}: {e}")
+            print(f"❌ Error syncing products for {shop}: {e}")
             break
     
-    print(f"✅ Synced {total} products for {shop}")
+    print(f"✅ Synced {total_pg} products to PostgreSQL and {total_qdrant} embeddings to Qdrant for {shop}")
 
 def sync_single_product(shop: str, product_gid: str, db: Session):
-    """Background job: Sync a single product"""
+    """Background job: Sync a single product to PostgreSQL and Qdrant"""
     token = get_shop_token(db, shop)
     
     query = """
@@ -315,6 +359,7 @@ def sync_single_product(shop: str, product_gid: str, db: Session):
         image_url = (n.get("featuredImage") or {}).get("url") or ""
         product_url = n.get("onlineStoreUrl") or f"https://{shop}/products/{handle}"
         
+        # 1. Upsert to PostgreSQL
         product = db.query(Product).filter_by(shopify_gid=gid).first()
         if not product:
             product = Product(shop=shop, shopify_gid=gid)
@@ -328,10 +373,26 @@ def sync_single_product(shop: str, product_gid: str, db: Session):
         db.add(product)
         db.commit()
         
-        print(f"✅ Synced product {title} for {shop}")
+        # 2. Embed and upsert to Qdrant
+        try:
+            upsert_product_to_qdrant(
+                client=qdrant_client,
+                collection_name=QDRANT_COLLECTION,
+                shopify_gid=gid,
+                shop=shop,
+                title=title,
+                description=description,
+                handle=handle,
+                image_url=image_url,
+                product_url=product_url,
+                image_weight=IMAGE_WEIGHT
+            )
+            print(f"✅ Synced and embedded product: {title}")
+        except Exception as e:
+            print(f"⚠️ Failed to embed product {gid}: {e}")
     
     except Exception as e:
-        print(f"Error syncing product {product_gid} for {shop}: {e}")
+        print(f"❌ Error syncing product {product_gid} for {shop}: {e}")
 
 # ==================== Search API (for storefront widget) ====================
 
