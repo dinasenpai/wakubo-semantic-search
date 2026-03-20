@@ -5,22 +5,25 @@ import secrets
 import time
 import urllib.parse
 import requests
-import torch
-import clip
 import io
 
 from fastapi import FastAPI, Depends, Form, HTTPException, Request, BackgroundTasks, UploadFile, File
 from fastapi.responses import RedirectResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import or_
+from sqlalchemy import or_, func
 from PIL import Image
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 from db import Base, engine, get_db
 from models import ShopToken, Product
-from embedding import init_qdrant_collection, upsert_product_to_qdrant, get_clip_model
+from embedding import (
+    init_qdrant_collection,
+    upsert_product_to_qdrant,
+    encode_text_embedding,
+    encode_image_embedding,
+)
 
 
 app = FastAPI(title="Wakubo Semantic Search Backend")
@@ -32,12 +35,15 @@ Base.metadata.create_all(bind=engine)
 SHOPIFY_API_KEY = os.getenv("SHOPIFY_API_KEY")
 SHOPIFY_API_SECRET = os.getenv("SHOPIFY_API_SECRET")
 SCOPES = os.getenv("SCOPES", "read_products")
-APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8000")
-QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+APP_BASE_URL = os.getenv("APP_BASE_URL", "https://wakubo-semantic-search-production.up.railway.app")
+QDRANT_URL = os.getenv("QDRANT_URL", "https://fce0ab36-2503-4245-ad43-e4c8a472089a.eu-central-1-0.aws.cloud.qdrant.io")
+QDRANT_API_KEY= os.getenv("QDRANT_API_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.PFBDbr1kZ_vYHUWJ-aliCrW99qkmMHtFEyTRoIbrFOM")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "wakubo_products")
 IMAGE_WEIGHT = float(os.getenv("IMAGE_WEIGHT", "0.6"))
+WEBHOOK_CALLBACK_URL = f"{APP_BASE_URL.rstrip('/')}/webhooks/shopify"
+PRODUCT_WEBHOOK_TOPICS = ("PRODUCTS_CREATE", "PRODUCTS_UPDATE", "PRODUCTS_DELETE")
 
-qdrant_client = QdrantClient(url=QDRANT_URL)
+qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 init_qdrant_collection(qdrant_client, QDRANT_COLLECTION)
 
 # CORS - allow any Shopify store + local dev
@@ -92,6 +98,58 @@ def shopify_graphql(shop: str, access_token: str, query: str, variables: dict = 
         raise HTTPException(500, {"shopify_errors": payload["errors"]})
     
     return payload
+
+
+def ensure_product_webhooks(shop: str, access_token: str) -> dict:
+    """
+    Ensure product create/update/delete webhooks exist for this app installation.
+    Uses explicit GraphQL registration so webhook delivery does not depend only on CLI deploy state.
+    """
+    mutation = """
+    mutation RegisterWebhook($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) {
+      webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
+        webhookSubscription { id topic }
+        userErrors { field message }
+      }
+    }
+    """
+
+    created = []
+    already_exists = []
+    failed = []
+
+    for topic in PRODUCT_WEBHOOK_TOPICS:
+        payload = shopify_graphql(
+            shop,
+            access_token,
+            mutation,
+            {
+                "topic": topic,
+                "webhookSubscription": {
+                    "callbackUrl": WEBHOOK_CALLBACK_URL,
+                    "format": "JSON",
+                },
+            },
+        )
+
+        result = payload["data"]["webhookSubscriptionCreate"]
+        errors = result.get("userErrors") or []
+        if not errors:
+            created.append(topic)
+            continue
+
+        message_text = " | ".join((e.get("message") or "").lower() for e in errors)
+        if "already" in message_text and ("taken" in message_text or "exists" in message_text):
+            already_exists.append(topic)
+        else:
+            failed.append({"topic": topic, "errors": errors})
+
+    return {
+        "callback_url": WEBHOOK_CALLBACK_URL,
+        "created": created,
+        "already_exists": already_exists,
+        "failed": failed,
+    }
 
 # ==================== OAuth Endpoints ====================
 
@@ -175,6 +233,13 @@ def auth_callback(
     
     db.add(shop_token)
     db.commit()
+
+    # Ensure webhooks are registered for this installation.
+    try:
+        webhook_status = ensure_product_webhooks(shop, access_token)
+        print(f"[webhook] registration status for {shop}: {webhook_status}")
+    except Exception as e:
+        print(f"[webhook] failed to register webhooks for {shop}: {e}")
     
     # Auto-sync products in background
     background_tasks.add_task(sync_shop_products, shop, access_token, db)
@@ -202,6 +267,10 @@ async def shopify_webhook(
     hmac_header = request.headers.get("X-Shopify-Hmac-SHA256", "")
     shop = request.headers.get("X-Shopify-Shop-Domain", "")
     topic = request.headers.get("X-Shopify-Topic", "")
+    webhook_id = request.headers.get("X-Shopify-Webhook-Id", "")
+    print(f"[webhook] received topic={topic} shop={shop} webhook_id={webhook_id}")
+    if not SHOPIFY_API_SECRET:
+        raise HTTPException(500, "Missing SHOPIFY_API_SECRET in backend environment")
     
     body = await request.body()
     
@@ -214,6 +283,7 @@ async def shopify_webhook(
     computed_hmac = __import__("base64").b64encode(digest).decode()
     
     if not hmac.compare_digest(computed_hmac, hmac_header):
+        print(f"[webhook] invalid hmac topic={topic} shop={shop} webhook_id={webhook_id}")
         raise HTTPException(401, "Invalid webhook signature")
     
     data = await request.json()
@@ -242,6 +312,16 @@ async def shopify_webhook(
 
     
     return {"status": "ok"}
+
+
+@app.post("/admin/webhooks/register")
+def register_webhooks(shop: str = Form(...), db: Session = Depends(get_db)):
+    """
+    Manual webhook registration for already-installed shops.
+    Useful after config/url changes without reinstalling the app.
+    """
+    token = get_shop_token(db, shop)
+    return ensure_product_webhooks(shop, token)
 
 # ==================== Sync Functions ====================
 
@@ -401,74 +481,96 @@ def sync_single_product(shop: str, product_gid: str, db: Session):
 @app.post("/api/search/text")
 def search_text(query: str = Form(...), shop: str = Form(None), db: Session = Depends(get_db)):
     """
-    Optimized text search with 3-tier fallback:
+    Optimized text search with 2-tier fallback:
     1. PostgreSQL ILIKE (fastest regex)
-    2. Qdrant payload regex (title + description)
-    3. Qdrant text embedding vector search (semantic)
+    2. Qdrant fused embedding vector search (semantic)
     """
     if not query or not query.strip():
         return {"products": []}
-    
+
     query_lower = query.lower().strip()
-    
+
     # Step 1: Try PostgreSQL ILIKE (fastest)
-    q = f"%{query}%"
+    patterns = [
+        f"% {query_lower} %",   # surrounded by spaces
+        f"% {query_lower}",     # at end
+        f"{query_lower} %",     # at start
+        f"{query_lower}"        # exact
+    ]
+
     sql_query = db.query(Product).filter(
-        or_(Product.title.ilike(q), Product.description.ilike(q))
+        or_(
+            *[func.lower(Product.title).like(p) for p in patterns],
+            *[func.lower(Product.description).like(p) for p in patterns]
+        )
     )
+
     if shop:
         sql_query = sql_query.filter(Product.shop == shop)
-    
+
     rows = sql_query.limit(10).all()
-    
-    if rows:
-        return {
-            "products": [
-                {
-                    "id": r.id,
-                    "title": r.title,
-                    "description": r.description[:200] if r.description else "",
-                    "price": "0.00",
-                    "handle": r.handle,
-                    "image_url": r.image_url,
-                    "product_url": r.product_url,
-                    "score": 1.0,
-                    "source": "postgresql"
-                }
-                for r in rows
-            ]
+
+    products = [
+        {
+            "id": r.id,
+            "title": r.title,
+            "description": r.description[:200] if r.description else "",
+            "price": "0.00",
+            "handle": r.handle,
+            "image_url": r.image_url,
+            "product_url": r.product_url,
+            "score": 1.0,
+            "source": "postgresql"
         }
-    
-    # Step 2: Try Qdrant payload scroll (regex match on title + description)
-    try:
-        scroll_filter = None
-        if shop:
-            scroll_filter = Filter(must=[FieldCondition(key="shop", match=MatchValue(value=shop))])
-        
-        # Scroll through all products for this shop
-        scroll_results, _ = qdrant_client.scroll(
-            collection_name=QDRANT_COLLECTION,
-            scroll_filter=scroll_filter,
-            limit=100,  # Get more to filter locally
-            with_payload=True,
-            with_vectors=False,
-        )
-        
-        # Filter locally by regex on title + description
-        matched = []
-        for point in scroll_results:
-            title = point.payload.get("title", "").lower()
-            description = point.payload.get("description", "").lower()
-            
-            if query_lower in title or query_lower in description:
-                matched.append(point.payload["shopify_gid"])
-        
-        if matched:
-            rows = db.query(Product).filter(Product.shopify_gid.in_(matched[:10])).all()
-            
-            if rows:
-                return {
-                    "products": [
+        for r in rows
+    ]
+
+    # Step 2: Top up with fused embedding search if PostgreSQL returned < 10
+    if len(products) < 10:
+        try:
+            print(f"Fused embedding top-up for: '{query}'")
+
+            query_vector = encode_text_embedding(query)
+            print(f"Query embedding sample: {query_vector[:10]}")
+            print(f"Query embedding length: {len(query_vector)}")
+
+            search_filter = None
+            if shop:
+                search_filter = Filter(must=[FieldCondition(key="shop", match=MatchValue(value=shop))])
+                print(f"Filtering by shop: {shop}")
+
+            remaining = 10 - len(products)
+            existing_gids = {r.shopify_gid for r in rows}
+
+            search_result = qdrant_client.query_points(
+                collection_name=QDRANT_COLLECTION,
+                query=query_vector,
+                using="fused",
+                query_filter=search_filter,
+                limit=remaining + 10,
+                score_threshold=0.3,
+            )
+
+            points = search_result.points if hasattr(search_result, "points") else search_result
+            print(f"[fused] Found {len(points)} results")
+
+            score_map = {}
+            topup_gids = []
+            for p in points:
+                gid = p.payload["shopify_gid"]
+                if gid in existing_gids or gid in score_map:
+                    continue
+                score_map[gid] = round(p.score, 4)
+                topup_gids.append(gid)
+                if len(topup_gids) >= remaining:
+                    break
+
+            if topup_gids:
+                extra_rows = db.query(Product).filter(Product.shopify_gid.in_(topup_gids)).all()
+                extra_rows_sorted = sorted(extra_rows, key=lambda x: score_map.get(x.shopify_gid, 0), reverse=True)
+
+                products.extend(
+                    [
                         {
                             "id": r.id,
                             "title": r.title,
@@ -477,85 +579,18 @@ def search_text(query: str = Form(...), shop: str = Form(None), db: Session = De
                             "handle": r.handle,
                             "image_url": r.image_url,
                             "product_url": r.product_url,
-                            "score": 0.9,
-                            "source": "qdrant_payload"
+                            "score": score_map.get(r.shopify_gid, 0.5),
+                            "source": "qdrant_embedding"
                         }
-                        for r in rows
+                        for r in extra_rows_sorted
                     ]
-                }
-    except Exception as e:
-        print(f"⚠️ Qdrant payload search failed: {e}")
-    
-    # Step 3: Text embedding vector search (semantic, slowest)
-    try:
-        print(f"🔤 Text embedding search for: '{query}'")
-        
-        model, _, device = get_clip_model()
-        
-        # Embed query text
-        text_tokens = clip.tokenize([query], truncate=True).to(device)
-        with torch.no_grad():
-            txt_emb = model.encode_text(text_tokens)
-            txt_emb = txt_emb / txt_emb.norm(dim=-1, keepdim=True)
-            query_vector = txt_emb.cpu().numpy().flatten().tolist()
-        
-        # Debug: Print embedding sample
-        print(f"🔤 Query embedding sample: {query_vector[:10]}")
-        print(f"🔤 Query embedding length: {len(query_vector)}")
-        
-        # Build filter
-        search_filter = None
-        if shop:
-            search_filter = Filter(must=[FieldCondition(key="shop", match=MatchValue(value=shop))])
-            print(f"🔤 Filtering by shop: {shop}")
-        
-        # Search Qdrant with text vector (qdrant-client 1.16.2 API)
-        search_result = qdrant_client.query_points(
-            collection_name=QDRANT_COLLECTION,
-            query=query_vector,
-            using="text",
-            query_filter=search_filter,
-            limit=10,
-            score_threshold=0.3,  # Lowered threshold like image search
-        )
-        
-        results = search_result.points if hasattr(search_result, 'points') else search_result
-        
-        # Debug: Print all results with scores
-        print(f"🔤 Found {len(results)} results:")
-        for r in results:
-            print(f"  - {r.payload.get('title', 'N/A')} (score: {r.score:.4f})")
-        
-        if results:
-            shopify_gids = [r.payload["shopify_gid"] for r in results]
-            rows = db.query(Product).filter(Product.shopify_gid.in_(shopify_gids)).all()
-            
-            # Create score map and sort by score (same as image search)
-            score_map = {r.payload["shopify_gid"]: r.score for r in results}
-            rows_sorted = sorted(rows, key=lambda x: score_map.get(x.shopify_gid, 0), reverse=True)
-            
-            return {
-                "products": [
-                    {
-                        "id": r.id,
-                        "title": r.title,
-                        "description": r.description[:200] if r.description else "",
-                        "price": "0.00",
-                        "handle": r.handle,
-                        "image_url": r.image_url,
-                        "product_url": r.product_url,
-                        "score": round(score_map.get(r.shopify_gid, 0.5), 4),  # Round to 4 decimals
-                        "source": "qdrant_embedding"
-                    }
-                    for r in rows_sorted
-                ]
-            }
-    except Exception as e:
-        print(f"⚠️ Qdrant embedding search failed: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    return {"products": []}
+                )
+        except Exception as e:
+            print(f"Qdrant fused embedding search failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    return {"products": products[:10]}
 
 @app.post("/api/search/image")
 async def search_image(
@@ -573,18 +608,8 @@ async def search_image(
         
         image_pil = Image.open(io.BytesIO(contents)).convert("RGB")
         print(f"📸 Image opened: {image_pil.size}, mode: {image_pil.mode}")
-        
-        # Get CLIP model
-        model, preprocess, device = get_clip_model()
-        
         # Embed query image
-        image_tensor = preprocess(image_pil).unsqueeze(0).to(device)
-        print(f"📸 Image tensor shape: {image_tensor.shape}")
-        
-        with torch.no_grad():
-            img_emb = model.encode_image(image_tensor)
-            img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
-            query_vector = img_emb.cpu().numpy().flatten().tolist()
+        query_vector = encode_image_embedding(image_pil)
         
         # Debug: Print first 10 values of embedding
         print(f"📸 Query embedding sample: {query_vector[:10]}")
@@ -682,3 +707,4 @@ def sync_status(shop: str, db: Session = Depends(get_db)):
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "wakubo-semantic-search-backend"}
+
