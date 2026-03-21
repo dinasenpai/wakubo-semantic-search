@@ -152,6 +152,9 @@ def ensure_product_webhooks(shop: str, access_token: str) -> dict:
     }
 
 # ==================== OAuth Endpoints ====================
+@app.get("/")
+def root():
+    return RedirectResponse(url="https://wakub0.netlify.app/", status_code=302)
 
 @app.get("/auth/install")
 def auth_install(shop: str):
