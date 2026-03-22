@@ -5,6 +5,13 @@
     init();
   }
 
+  window.addEventListener('pageshow', function(e) {
+    if (e.persisted) {
+      // Page was restored from bfcache, re-run the intercept + panel restore
+      checkSearchPageIntercept();
+    }
+  });
+
   function init() {
     const container = document.getElementById('semantic-search-float');
     const panel = document.getElementById('search-panel');
@@ -35,6 +42,8 @@
     });
 
     cameraInput.addEventListener('change', handleImageSearch);
+
+    
 
     // -----------------------------
     // UI overlay logic
@@ -635,9 +644,6 @@
         return;
       }
 
-      sessionStorage.removeItem('wakubo_results');
-      sessionStorage.removeItem('wakubo_query');
-
       if (!products || !products.length) return;
 
       const NATIVE_GRIDS = [
@@ -657,27 +663,29 @@
         if (el) el.style.display = 'none';
       }
 
-      const wrapper = document.createElement('div');
-      wrapper.innerHTML = `
-        <p class="wakubo-results-heading">Search Results (${products.length})</p>
-        <div class="wakubo-results-page">
-          ${products
-            .map(
-              (p) => `
-            <div class="product-result">
-              ${p.image_url ? `<img src="${p.image_url}" alt="${escapeHtml(p.title)}" loading="lazy">` : ''}
-              <h4>${escapeHtml(p.title)}</h4>
-              <p>${escapeHtml((p.description || '').substring(0, 100))}${(p.description || '').length > 100 ? '...' : ''}</p>
-              <a href="${p.product_url || '/products/' + p.handle}">View Product →</a>
-            </div>
-          `
-            )
-            .join('')}
-        </div>
-      `;
+      if (!document.querySelector('.wakubo-results-page')) {
+        const wrapper = document.createElement('div');
+        wrapper.innerHTML = `
+          <p class="wakubo-results-heading">Search Results (${products.length})</p>
+          <div class="wakubo-results-page">
+            ${products
+              .map(
+                (p) => `
+              <div class="product-result">
+                ${p.image_url ? `<img src="${p.image_url}" alt="${escapeHtml(p.title)}" loading="lazy">` : ''}
+                <h4>${escapeHtml(p.title)}</h4>
+                <p>${escapeHtml((p.description || '').substring(0, 100))}${(p.description || '').length > 100 ? '...' : ''}</p>
+                <a href="${p.product_url || '/products/' + p.handle}">View Product →</a>
+              </div>
+            `
+              )
+              .join('')}
+          </div>
+        `;
 
-      const anchor = document.querySelector('main, #MainContent, .main-content, [role="main"]');
-      if (anchor) anchor.appendChild(wrapper);
+        const anchor = document.querySelector('main, #MainContent, .main-content, [role="main"]');
+        if (anchor) anchor.appendChild(wrapper);
+      }
     }
 
     function escapeHtml(str) {
@@ -709,8 +717,12 @@
         const data = await response.json();
 
         if (data.products && data.products.length > 0) {
+          sessionStorage.removeItem('wakubo_results');
+          sessionStorage.removeItem('wakubo_query');
+
           sessionStorage.setItem('wakubo_results', JSON.stringify(data.products));
           sessionStorage.setItem('wakubo_query', query);
+          sessionStorage.setItem('wakubo_panel_open', '1');
           window.location.href = '/search?q=' + encodeURIComponent(query) + '&wakubo=1';
         } else {
           resultsContainer.innerHTML =
@@ -741,8 +753,12 @@
         const data = await response.json();
 
         if (data.products && data.products.length > 0) {
+          sessionStorage.removeItem('wakubo_results');
+          sessionStorage.removeItem('wakubo_query');
+
           sessionStorage.setItem('wakubo_results', JSON.stringify(data.products));
           sessionStorage.setItem('wakubo_query', 'image-search');
+          sessionStorage.setItem('wakubo_panel_open', '1');
           window.location.href = '/search?q=image-search&wakubo=1';
         } else {
           resultsContainer.innerHTML =
